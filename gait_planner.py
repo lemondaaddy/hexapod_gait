@@ -1,3 +1,4 @@
+from matplotlib.axes import Axes
 import numpy as np
 from enum import Enum
 from arm import Arm
@@ -72,36 +73,69 @@ def solve_quintic_for_T(q0, qf, v0, vf, a0, af, T):
 
 
 class StepPhase:
-    def __init__(self, id):
+    def __init__(self, id, init_speed: Tuple[float, float], acc: Tuple[float, float], stride: Tuple[float, float], period_stride: Tuple[float, float]):
         self.id = id
-        self.init_speed = None # 初始速度
-        self.final_speed = None # 末速度
-        self.started_at = 0 # 起始时间
-        self.time_span = 0
+        self.init_speed = np.array(init_speed, dtype=float) 
+        self.acc = np.array(acc, dtype=float)  # 加速度
+        self.stride = np.array(stride, dtype=float)  # 步幅
+        self.final_speed = np.zeros(2, dtype=float)
+        self.time_span = 0.0
+        self.time_elapsed = 0.0
+
+        # 如果提供了运动参数，则解算阶段时间与末速度
+     
+        t_axis = np.zeros(2, dtype=float)
+        for i in range(2):
+            v0 = self.init_speed[i]
+            a = self.acc[i]
+            s = self.stride[i]
+
+            if np.isclose(a, 0.0):
+                if np.isclose(v0, 0.0) or np.isclose(s, 0.0):
+                    t_axis[i] = 0.0
+                else:
+                    t_axis[i] = s / v0
+            else:
+                A = 0.5 * a
+                B = v0
+                C = -s
+                disc = B * B - 4 * A * C
+                disc = max(disc, 0.0)
+                sqrt_disc = np.sqrt(disc)
+                t0 = (-B + sqrt_disc) / (2 * A)
+                t1 = (-B - sqrt_disc) / (2 * A)
+                candidates = [t for t in (t0, t1) if t > 0]
+                t_axis[i] = min(candidates) if candidates else 0.0
+
+            self.time_span = max(t_axis)
+            self.final_speed = self.init_speed + self.acc * self.time_span
+            self.swing_quintic = solve_quintic_for_T(-period_stride[0]/2, period_stride[0]/2, -self.init_speed[0], -self.final_speed[0], 0, 0, self.time_span)
+
+    def step(self, dt:float):
+        if self.time_elapsed + dt > self.time_span:
+            self.time_elapsed = self.time_span
+            remain = self.time_elapsed + dt - self.time_span
+        else:
+            self.time_elapsed += dt
+            remain = 0.0
+        t = self.time_elapsed
+        self.swing_pos = self.swing_quintic[0] + self.swing_quintic[1] * t + self.swing_quintic[2] * t ** 2 + self.swing_quintic[3] * t ** 3 + self.swing_quintic[4] * t ** 4 + self.swing_quintic[5] * t ** 5
+        self.swing_vel = self.swing_quintic[1] + self.swing_quintic[2] * 2 * t + self.swing_quintic[3] * 3 * t ** 2 + self.swing_quintic[4] * 4 * t ** 3 + self.swing_quintic[5] * 5 * t ** 4
+        
+        self.stand_pos = self.init_speed * self.time_elapsed + 0.5 * self.acc * self.time_elapsed ** 2
+        self.stand_vel = self.init_speed + self.acc * self.time_elapsed
+
+        return remain
 
     @property
-    def U(self):
-        return self.u
-    
-    @U.setter
-    def U(self, x, y):
-        self.u = np.array([x, y])
+    def swing_pos_vel(self):
 
-    @property
-    def V(self):
-        return self.v
+        return self.swing_pos, self.swing_vel
     
-    @V.setter
-    def V(self, x, y):
-        self.v = np.array([x, y])
-
     @property
-    def T(self):
-        return self.time_span
+    def stand_pos_vel(self):
+        return self.stand_pos, self.stand_vel
     
-    @T.setter
-    def T(self, value):
-        self.time_span = value
 
 
 
@@ -117,28 +151,41 @@ class GaitPeriod:
         self.started_at = t
         self.time_eslapsed = 0
         self.cur_v = np.array(init_vel) # 当前速度
-        self.cur_pos = np.zeros(2) # 当前位移
+        self.cur_pos = np.zeros(2   , dtype=np.float32) # 当前位移
         self._calc_params()
+        self.phase = None
 
     def step(self, dt:float) -> Tuple[np.ndarray, np.ndarray, float]:
+
+        if self.phase is None:
+            self.phase = StepPhase(0, self.init_v.copy(), self.acc.copy(), self.stride.copy()/6, self.stride.copy())
+        
         real_dt = self.period - self.time_eslapsed if (self.time_eslapsed + dt) > self.period else dt
-       
-        new_vel = self.init_v + self.acc * real_dt
+        new_vel = self.cur_v + self.acc * real_dt
+
+        #print(f"GaitPeriod step: dt={dt:.4f}, real_dt={real_dt:.4f}, new_vel={new_vel}, time_eslapsed={self.time_eslapsed:.4f}, period={self.period:.4f} ")
+    
         delta_pos = (self.cur_v + new_vel) * real_dt / 2
-        self.cur_v = new_vel
+        self.cur_v = new_vel.copy()
         self.cur_pos += delta_pos
         self.time_eslapsed += real_dt
 
-        return self.cur_v, delta_pos, dt - real_dt
+        phase_remain = self.phase.step(real_dt)
+        if phase_remain > 1e-5:
+            self.phase = StepPhase(self.phase.id + 1, self.phase.final_speed.copy(), self.acc.copy(), self.stride.copy()/6, self.stride.copy())
+            self.phase.step(phase_remain)
+
+        return delta_pos.copy(), self.cur_v.copy(),  dt - real_dt
     
     def _calc_params(self):
         acc = (self.final_v ** 2 - self.init_v ** 2) / (2 * self.stride)
+        print(f"GaitPeriod calc_params: raw acc={acc}, max_acc={self.max_acc}")
+        self.acc = np.zeros(2, dtype=np.float32)
 
-        self.acc = np.zeros_like(self.init_v)
-        self.acc[0] = acc[0] if np.abs(acc[0]) <= self.max_acc[0] else (self.max_acc[0] if acc[0] > 0 else -self.max_acc[0])
-        self.acc[1] = acc[1] if np.abs(acc[1]) <= self.max_acc[1] else (self.max_acc[1] if acc[1] > 0 else -self.max_acc[1])
-
-        t_axis = np.zeros(2)
+        self.acc[0] = acc[0] if (np.abs(acc[0]) <= self.max_acc[0]) else (self.max_acc[0] if acc[0] > 0 else -self.max_acc[0])
+        self.acc[1] = acc[1] if (np.abs(acc[1]) <= self.max_acc[1]) else (self.max_acc[1] if acc[1] > 0 else -self.max_acc[1])
+        print(f"GaitPeriod calc_params: raw acc={self.acc}")
+        t_axis = np.zeros(2, dtype=np.float32)
         for i in range(2):
             if np.isclose(self.acc[i], 0.0):
                 t_axis[i] = self.stride[i] / self.init_v[i] if not np.isclose(self.init_v[i], 0.0) else 0.0
@@ -152,7 +199,7 @@ class GaitPeriod:
                 t_axis[i] = max(candidates) if candidates else 0.0
 
         self.period = max(t_axis)
-
+        print(f"GaitPeriod calc_params: init_v={self.init_v}, final_v={self.final_v}, stride={self.stride}, acc={self.acc}, period={self.period}")
         # 根据同步后的周期，反推新的末速度与对应轴步幅，保持加速度约束
         self.final_v = self.init_v + self.acc * self.period
         new_stride = np.zeros_like(self.stride)
@@ -170,7 +217,7 @@ class GaitPeriod:
 
 class MoveGaitPlanner:
     SWING_Z_SRIDE = 0.00
-    PERIOD_STRIDE = (0.08, 0.02)
+    PERIOD_STRIDE = (0.1, 0.02)
     MAX_ACC = (0.1, 0.05)
 
     BASE_Z = -0.08 # 重心离地高度  # LOW 0.05 HIGH 0.05
@@ -190,6 +237,14 @@ class MoveGaitPlanner:
         self.tick_time = 0
         for arm in self.robot.arms.values():
             self.set_arm_init_pos(arm)
+
+    @property
+    def body_vel(self):
+        return self.vel
+    
+    @property
+    def body_pos(self):
+        return self.pos
         
     @property
     def stride(self):
@@ -227,63 +282,17 @@ class MoveGaitPlanner:
         print(f"Arm {arm.id} init foot pos: {self.init_foot_pos[arm.id]}")
         arm.set_foot_coor(self.init_foot_pos[arm.id])
     
-
-
-    def __calc_phase_params(self, phase_id, dt, b_m):
-
-        _phase = StepPhase(phase_id)
-
-        _phase.U = self.u + self.acc * dt
-        _phase.V = np.sqrt(self.u ** 2 + self.phase_s * self.acc * 2)
-        _phase.T = self.time + dt
-
-        self.Phase = StepPhase(phase)
-        self.phase_array.append(self.Phase)
-        self.phase_u = self.u + self.acc * dt
-        
-        self.phase_s =  self.s / self.gait.PhaseCount * (phase + 1) 
-        #if self._first_period and phase == 0:
-        #    self.phase_s /= 2
-        
-        self.phase_v = np.sqrt(self.u ** 2 + self.phase_s * self.acc * 2)
-        self.phase_t = t
-        
-        self.phase_t_arr.append(self.phase_t)
-        self.phase_v_arr.append(self.phase_v)
-
-        
-        if self.acc == 0: # 匀速运动
-            phase_span = self.period / self.gait.PhaseCount
-        else:
-            phase_span = ( self.phase_v - self.phase_u ) / self.acc
-
-        swing_init_pos = - self.s / self.gait.PhaseCount * self.phase 
-        swing_final_pos = swing_init_pos + (self.s / self.gait.PhaseCount) * (self.gait.PhaseCount - 1) 
-
-
-        self.phase_pos.append(swing_final_pos)
-        self.swing_quintic = solve_quintic_for_T(swing_init_pos, swing_final_pos, -self.phase_u, -self.phase_v, 0, 0, phase_span)
-
     
-    def swing_phase_pos_vel(self, t):
-        t = t - self.phase_t
-        pos = self.swing_quintic[0] + self.swing_quintic[1] * t + self.swing_quintic[2] * t ** 2 + self.swing_quintic[3] * t ** 3 + self.swing_quintic[4] * t ** 4 + self.swing_quintic[5] * t ** 5
-        vel = self.swing_quintic[1] + self.swing_quintic[2] * 2 * t + self.swing_quintic[3] * 3 * t ** 2 + self.swing_quintic[4] * 4 * t ** 3 + self.swing_quintic[5] * 5 * t ** 4
-
-        return pos, vel
-
-    def next_period(self, t):
-        return
 
     def step(self, dt:float, target_vel:Tuple[float, float]):
         
         if self.period is None:
             self.period = GaitPeriod(self.tick_time, (0, 0), target_vel, self.MAX_ACC, self.PERIOD_STRIDE)
 
-        
         pos, vel, remain = self.period.step(dt)
         self.vel = vel
         self.pos += pos
+        self.tick_time += dt - remain
 
         if remain > 1e-5:
             self.period = GaitPeriod(self.tick_time, self.vel, target_vel, self.MAX_ACC, self.PERIOD_STRIDE)
@@ -291,21 +300,64 @@ class MoveGaitPlanner:
             self.vel = vel
             self.pos += pos
 
-        self.tick_time += dt
+            self.tick_time += remain
 
+
+
+
+class body_speed_line:
+    def __init__(self, ax:Axes):
+        self.ax = ax
+        self.ax.grid(True)
+        self.line_p, = ax.plot([], [], 'r-',  label='Position')
+        self.line_v, = ax.plot([], [], 'b-', label='Velocity')
+        self.ax.legend()
+        self.v = []
+        self.p = []
+        self.t = []
+    def update(self, pos:Tuple[float, float], vel:Tuple[float, float], time:float):
+        self.p.append(pos)
+        self.v.append(vel)
+        self.t.append(time)
+        #self.line_p.set_data(self.t, np.array(self.p)[:,0])
+        #self.line_v.set_data(self.t, np.array(self.v)[:,0])
+        #self.ax.relim()
+        #self.ax.autoscale_view()
+
+    def show(self):
+        self.line_p.set_data(self.t, np.array(self.p)[:,0])
+        self.line_v.set_data(self.t, np.array(self.v)[:,0])
+        self.ax.relim()
+        self.ax.autoscale_view()
 
 if __name__ == '__main__':
     from matplotlib import pyplot as plt
     from robot import HexaRobot, Arm
     
+    plt.ion()
+    fig = plt.figure(figsize=(20, 10))
+    body_ax = fig.add_subplot(121)
+
+    body_line = body_speed_line(body_ax)
+
     robot = HexaRobot()
-    
+    times = []
     gait = MoveGaitPlanner(robot)
 
     t = time.time()
-    while True:
+    t_start = t
+    for i in range(0, 5000):
+        time.sleep(0.0005)
         dt = time.time() - t
-        gait.step(dt, (0.1, 0))
+        gait.step(dt, (0.05, 0))
         t += dt
 
-        print(f'delta time: {dt}')
+        times.append(dt)
+        body_line.update(gait.body_pos.copy(), gait.body_vel.copy(), (t - t_start) * 1000)
+        
+    #plt.pause(0.0001)
+
+    body_line.show()
+    plt.ioff()
+    plt.show()
+    print(np.max(times))

@@ -9,8 +9,8 @@ class Arm:
         self.L0 = length[0]
         self.L1 = length[1]
         self.L2 = length[2]
-        self._pos = 0
-        self._v = 0
+        self.foot_pos = np.zeros(3, dtype=float)
+        self.foot_vel = np.zeros(3, dtype=float)
         self.joints:list[Joint] = []
         
         for i in range(3):
@@ -18,22 +18,45 @@ class Arm:
 
         self.yDir = yDir
         self.xFactor = -1 if yDir == 1 else 1
+        
+    @property
+    def VelBody(self):
+        return self.foot_vel.copy()
+    
+    @VelBody.setter
+    def VelBody(self, value):
+        self.foot_vel = value
 
     @property
-    def Position(self):
-        return self._pos
+    def PositionBody(self):
+        return self.foot_pos.copy()
     
-    @Position.setter
-    def Position(self, value):
-        self._pos = value 
+    def __calc_angles(self):
+        coor = self.foot_pos - self.base_coor
+        q_J0, q_J1, q_J2 = ik(coor[0], coor[1]*self.yDir, coor[2], self.L0, self.L1, self.L2)
+        
+        A = np.array([q_J0, q_J1, q_J2])
+        self.A0 = A[0] * self. yDir
+        self.A1 = A[1] 
+        self.A2 = A[2]
+        
+    @PositionBody.setter
+    def PositionBody(self, value):
+        self.foot_pos = value 
+        #self.__calc_angles()
+        
+
+    def UpdatePositionBody(self, delta_pos: np.array):
+        self.foot_pos += delta_pos
+        #self.__calc_angles()
 
     @property
     def Vel(self):
-        return self._v
+        return self.foot_vel
     
     @Vel.setter
     def Vel(self, value):
-        self._v = value 
+        self.foot_vel = value 
 
     @property
     def A0(self):
@@ -67,19 +90,11 @@ class Arm:
         y = np.cos(A0) * S * self.yDir
         z =  L1*s1 + L2*s12
         return np.array([x, y, z])
-   
-    def set_foot_coor(self, coor_body:np.array):
-        coor = coor_body - self.base_coor
-        q_J0, q_J1, q_J2 = ik(coor[0], coor[1]*self.yDir, coor[2], self.L0, self.L1, self.L2)
-        
-        A = np.array([q_J0, q_J1, q_J2])
-        self.A0 = A[0] * self. yDir
-        self.A1 = A[1] 
-        self.A2 = A[2] 
 
     def get_foot_coor(self):
         _, _, _, foot_coor = self.get_joints_coor()
         return foot_coor
+    
     def get_joints_coor(self):
         theta1, theta2, theta3 = self.A0, self.A1, self.A2
 
